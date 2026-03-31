@@ -715,16 +715,15 @@ def process_dataframe(
         )
         if idx % 25 == 0 or idx == total:
             status_text.markdown(
-                (
-                    "<div class='progress-meta'>"
-                    f"<strong>Started:</strong> {format_timestamp(start_ts)}<br>"
-                    f"<strong>Last update:</strong> {format_timestamp(time.time())}<br>"
-                    f"<strong>Processed:</strong> {idx}/{total} rows<br>"
-                    f"<strong>Master DB hits:</strong> {master_hits}<br>"
-                    f"<strong>New LLM extractions:</strong> {llm_runs}"
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
+                "\n".join(
+                    [
+                        f"Started: `{format_timestamp(start_ts)}`",
+                        f"Last update: `{format_timestamp(time.time())}`",
+                        f"Processed: `{idx}/{total}` rows",
+                        f"Master DB hits: `{master_hits}`",
+                        f"New LLM extractions: `{llm_runs}`",
+                    ]
+                )
             )
 
     result_df["City"] = city_out
@@ -772,85 +771,17 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def inject_custom_styles() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container {
-            padding-top: 1.4rem;
-            padding-bottom: 2rem;
-            max-width: 1280px;
-        }
-        .app-shell {
-            background: linear-gradient(180deg, #f5f7fb 0%, #ffffff 100%);
-            border: 1px solid rgba(15, 23, 42, 0.08);
-            border-radius: 24px;
-            padding: 1.2rem 1.25rem;
-            box-shadow: 0 16px 40px rgba(15, 23, 42, 0.06);
-            margin-bottom: 1rem;
-        }
-        .hero-kicker {
-            color: #0f766e;
-            font-size: 0.82rem;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            margin-bottom: 0.35rem;
-        }
-        .hero-title {
-            color: #0f172a;
-            font-size: 2.15rem;
-            line-height: 1.05;
-            font-weight: 800;
-            margin-bottom: 0.4rem;
-        }
-        .hero-copy {
-            color: #475569;
-            font-size: 1rem;
-            max-width: 760px;
-            margin-bottom: 0;
-        }
-        .status-chip {
-            display: inline-block;
-            padding: 0.35rem 0.65rem;
-            border-radius: 999px;
-            background: #ecfeff;
-            color: #155e75;
-            font-size: 0.82rem;
-            font-weight: 600;
-            margin-right: 0.45rem;
-            margin-top: 0.3rem;
-        }
-        .progress-meta {
-            font-size: 0.92rem;
-            color: #334155;
-            line-height: 1.5;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def render_hero() -> None:
-    st.markdown(
-        """
-        <div class="app-shell">
-            <div class="hero-kicker">Streamlit V2 Workspace</div>
-            <div class="hero-title">Location Extraction Tool</div>
-            <p class="hero-copy">
-                Reuse cached master-database results, extract only what is missing, and monitor progress with a cleaner
-                processing dashboard built for large Excel workflows.
-            </p>
-            <div>
-                <span class="status-chip">Master DB Reuse</span>
-                <span class="status-chip">LLM Extraction</span>
-                <span class="status-chip">Excel Sheet Detection</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.title("Location Extraction Tool V2")
+    st.caption(
+        "Reuse cached master-database results, extract only what is missing, and monitor progress in a simpler native Streamlit workspace."
     )
+    with st.container(border=True):
+        st.write("Features")
+        feature_cols = st.columns(3)
+        feature_cols[0].info("Master DB reuse")
+        feature_cols[1].info("LLM extraction")
+        feature_cols[2].info("Excel sheet detection")
 
 
 def format_timestamp(ts: float) -> str:
@@ -859,7 +790,6 @@ def format_timestamp(ts: float) -> str:
 
 def main() -> None:
     st.set_page_config(page_title="Location Extraction Tool V2", layout="wide")
-    inject_custom_styles()
     render_hero()
 
     with st.sidebar:
