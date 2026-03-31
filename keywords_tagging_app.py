@@ -45,19 +45,52 @@ def load_rules_from_upload(uploaded_rules_file) -> Tuple[Dict[str, list], int]:
     return normalize_rules_payload(rules_data)
 
 
-def load_rules_from_path(rules_path: str) -> Tuple[Dict[str, list], int]:
-    with open(rules_path, "r", encoding="utf-8") as handle:
-        rules_data = json.load(handle)
-    logger.info("Rules loaded from local path: %s", rules_path)
-    return normalize_rules_payload(rules_data)
-
-
 def build_keyword_map(rules: Dict[str, list]) -> Dict[str, str]:
     keyword_map = {}
     for charge_type, keyword_list in rules.items():
         for keyword in keyword_list:
             keyword_map[str(keyword).lower()] = charge_type
     return keyword_map
+
+
+def rules_to_editor_dataframe(rules: Dict[str, list]) -> pd.DataFrame:
+    rows = []
+    for charge_type, keywords in rules.items():
+        for keyword in keywords:
+            rows.append({"Charge_Type": charge_type, "Keyword": keyword})
+    if not rows:
+        rows.append({"Charge_Type": "", "Keyword": ""})
+    return pd.DataFrame(rows)
+
+
+def editor_dataframe_to_rules(editor_df: pd.DataFrame) -> Dict[str, list]:
+    cleaned_df = editor_df.fillna("").copy()
+    cleaned_df["Charge_Type"] = cleaned_df["Charge_Type"].astype(str).str.strip()
+    cleaned_df["Keyword"] = cleaned_df["Keyword"].astype(str).str.strip()
+    cleaned_df = cleaned_df[
+        (cleaned_df["Charge_Type"] != "") & (cleaned_df["Keyword"] != "")
+    ]
+
+    rules: Dict[str, list] = {}
+    for _, row in cleaned_df.iterrows():
+        rules.setdefault(row["Charge_Type"], [])
+        if row["Keyword"] not in rules[row["Charge_Type"]]:
+            rules[row["Charge_Type"]].append(row["Keyword"])
+    return rules
+
+
+def build_rules_json_bytes(rules: Dict[str, list], threshold: int) -> bytes:
+    payload = {
+        "rules": rules,
+        "config": {"fuzzy_threshold": int(threshold)},
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def build_rules_filename(uploaded_rules_name: str) -> str:
+    base_name, _ = os.path.splitext(os.path.basename(uploaded_rules_name))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_edited_{timestamp}.json"
 
 
 def classify_charge(description, uom, cost_rate, keyword_map: Dict[str, str], threshold: int) -> str:
@@ -206,6 +239,54 @@ def render_rules_summary(rules: Dict[str, list], threshold: int) -> None:
     st.write(f"Fuzzy threshold: {threshold}")
 
 
+def persist_rules_editor_state(uploaded_rules_name: str, rules: Dict[str, list], threshold: int) -> None:
+    if st.session_state.get("rules_source_name") != uploaded_rules_name:
+        st.session_state["rules_source_name"] = uploaded_rules_name
+        st.session_state["rules_editor_df"] = rules_to_editor_dataframe(rules)
+        st.session_state["rules_threshold"] = int(threshold)
+
+
+def render_rules_editor(uploaded_rules_name: str) -> Tuple[Dict[str, list], int]:
+    st.subheader("Edit Rules")
+    edited_df = st.data_editor(
+        st.session_state["rules_editor_df"],
+        use_container_width=True,
+        num_rows="dynamic",
+        key="rules_editor_widget",
+    )
+    st.session_state["rules_editor_df"] = edited_df
+
+    edited_threshold = st.sidebar.number_input(
+        "Fuzzy threshold",
+        min_value=0,
+        max_value=100,
+        value=int(st.session_state["rules_threshold"]),
+        step=1,
+    )
+    st.session_state["rules_threshold"] = int(edited_threshold)
+
+    edited_rules = editor_dataframe_to_rules(edited_df)
+    edited_rules_filename = build_rules_filename(uploaded_rules_name)
+    edited_rules_bytes = build_rules_json_bytes(edited_rules, int(edited_threshold))
+
+    action_cols = st.columns(2)
+    if action_cols[0].button("Save rules to audit", type="secondary"):
+        audit_rules_path = os.path.join(AUDIT_DIR, edited_rules_filename)
+        with open(audit_rules_path, "wb") as handle:
+            handle.write(edited_rules_bytes)
+        logger.info("Edited rules saved to audit folder: %s", audit_rules_path)
+        st.success(f"Rules saved to: {audit_rules_path}")
+
+    action_cols[1].download_button(
+        label="Download edited rules",
+        data=edited_rules_bytes,
+        file_name=edited_rules_filename,
+        mime="application/json",
+    )
+
+    return edited_rules, int(edited_threshold)
+
+
 def main() -> None:
     st.set_page_config(page_title="Keywords Tagging Tool", layout="wide")
     st.title("Keywords Tagging Tool")
@@ -213,14 +294,13 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Settings")
+        uploaded_rules_file = st.file_uploader("Upload rules JSON", type=["json"])
+        uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
         description_column = st.text_input("Description column", value="Description")
         uom_column = st.text_input("UOM column", value="UOM (Volume)")
         rate_column = st.text_input("Rate column", value="Cost (Haul)/Rate")
         output_column = st.text_input("Output column", value="Charge_Type")
         st.caption(f"Audit log folder: `{AUDIT_DIR}`")
-
-    uploaded_rules_file = st.file_uploader("Upload rules JSON", type=["json"])
-    uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
 
     if uploaded_rules_file is None:
         st.info("Upload a rules JSON file to continue.")
@@ -233,10 +313,15 @@ def main() -> None:
         st.error(f"Unable to read uploaded rules JSON: {exc}")
         return
 
-    keyword_map = build_keyword_map(rules)
+    persist_rules_editor_state(uploaded_rules_file.name, rules, threshold)
 
     with st.expander("Rules Summary", expanded=False):
         render_rules_summary(rules, threshold)
+
+    with st.expander("Rules Editor", expanded=False):
+        rules, threshold = render_rules_editor(uploaded_rules_file.name)
+
+    keyword_map = build_keyword_map(rules)
 
     if not uploaded_file:
         st.info("Upload a file to begin.")
@@ -258,7 +343,8 @@ def main() -> None:
             st.info(f"Detected sheet: {selected_sheet_name}")
         else:
             default_index = sheet_names.index(DEFAULT_SHEET_NAME) if DEFAULT_SHEET_NAME in sheet_names else 0
-            selected_sheet_name = st.selectbox("Select sheet", options=sheet_names, index=default_index)
+            with st.sidebar:
+                selected_sheet_name = st.selectbox("Select sheet", options=sheet_names, index=default_index)
 
     try:
         source_df = load_input_file(uploaded_file, selected_sheet_name)
@@ -277,7 +363,10 @@ def main() -> None:
     with st.expander("Preview input data", expanded=True):
         st.dataframe(source_df.head(20), use_container_width=True)
 
-    if st.button("Run tagging", type="primary"):
+    with st.sidebar:
+        run_tagging = st.button("Process file", type="primary", use_container_width=True)
+
+    if run_tagging:
         try:
             logger.info("Run tagging button clicked for file: %s", uploaded_file.name)
             with st.spinner("Classifying charge types..."):
@@ -298,6 +387,19 @@ def main() -> None:
         st.success("Tagging completed.")
         st.caption(f"Audit log file: {LOG_FILE_PATH}")
         st.caption(f"Download file name: {output_filename}")
+
+        tag_counts = (
+            result_df[output_column]
+            .fillna("BLANK")
+            .astype(str)
+            .value_counts()
+            .rename_axis(output_column)
+            .reset_index(name="Count")
+        )
+
+        with st.expander("Tag Distribution", expanded=True):
+            st.bar_chart(tag_counts.set_index(output_column)["Count"])
+            st.dataframe(tag_counts, use_container_width=True)
 
         with st.expander("Preview output data", expanded=True):
             st.dataframe(result_df.head(50), use_container_width=True)
