@@ -774,14 +774,8 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 def render_hero() -> None:
     st.title("Location Extraction Tool V2")
     st.caption(
-        "Reuse cached master-database results, extract only what is missing, and monitor progress in a simpler native Streamlit workspace."
+        "Reuse cached master-database results, extract only what is missing, and track processing time while rows are being handled."
     )
-    with st.container(border=True):
-        st.write("Features")
-        feature_cols = st.columns(3)
-        feature_cols[0].info("Master DB reuse")
-        feature_cols[1].info("LLM extraction")
-        feature_cols[2].info("Excel sheet detection")
 
 
 def format_timestamp(ts: float) -> str:
@@ -839,33 +833,13 @@ def main() -> None:
         return
 
     st.success("File loaded successfully.")
-    summary_cols = st.columns(4)
-    summary_cols[0].metric("Rows", len(source_df))
-    summary_cols[1].metric("Columns", len(source_df.columns))
-    summary_cols[2].metric("File", uploaded_file.name)
-    summary_cols[3].metric("Sheet", selected_sheet_name or "CSV")
+    st.write(f"Rows: {len(source_df)}")
+    st.write(f"Columns: {', '.join(source_df.columns.astype(str))}")
+    st.write(f"Sheet: {selected_sheet_name or 'CSV'}")
+    render_master_database_section(master_database_path)
 
-    overview_tab, input_tab, master_tab = st.tabs(
-        ["Overview", "Input Preview", "Master Database"]
-    )
-
-    with overview_tab:
-        with st.container(border=True):
-            st.markdown(
-                f"""
-                **Address column:** `{address_column}`  
-                **Master database:** `{master_database_path}`  
-                **Available columns:** {", ".join(source_df.columns.astype(str))}
-                """
-            )
-
-    with input_tab:
-        with st.container(border=True):
-            st.subheader("Input Preview")
-            st.dataframe(source_df.head(20), use_container_width=True)
-
-    with master_tab:
-        render_master_database_section(master_database_path)
+    with st.expander("Preview input data", expanded=True):
+        st.dataframe(source_df.head(20), use_container_width=True)
 
     if address_column not in source_df.columns:
         st.error(f"Column '{address_column}' not found in the uploaded data.")
@@ -886,35 +860,25 @@ def main() -> None:
             return
 
         st.success("Extraction completed.")
-        results_tab, output_tab, cache_tab = st.tabs(
-            ["Run Summary", "Output Preview", "Updated Master DB"]
+        summary_cols = st.columns(5)
+        summary_cols[0].metric("Total rows", run_stats["total_rows"])
+        summary_cols[1].metric("Master hits", run_stats["master_hits"])
+        summary_cols[2].metric("LLM runs", run_stats["llm_runs"])
+        summary_cols[3].metric("Started", str(run_stats["started_at"]).split(" ")[1])
+        summary_cols[4].metric("Finished", str(run_stats["finished_at"]).split(" ")[1])
+        st.caption(
+            f"Elapsed: {run_stats['elapsed_seconds']}s | Master database updated at `{run_stats['master_database_path']}`"
         )
 
-        with results_tab:
-            with st.container(border=True):
-                top_metrics = st.columns(5)
-                top_metrics[0].metric("Total rows", run_stats["total_rows"])
-                top_metrics[1].metric("Master hits", run_stats["master_hits"])
-                top_metrics[2].metric("LLM runs", run_stats["llm_runs"])
-                top_metrics[3].metric("Started", str(run_stats["started_at"]).split(" ")[1])
-                top_metrics[4].metric("Finished", str(run_stats["finished_at"]).split(" ")[1])
-                st.caption(
-                    f"Elapsed: {run_stats['elapsed_seconds']}s | Master database updated at `{run_stats['master_database_path']}`"
-                )
+        with st.expander("Preview output data", expanded=True):
+            st.dataframe(result_df.head(50), use_container_width=True)
 
-        with output_tab:
-            with st.container(border=True):
-                st.subheader("Output Preview")
-                st.dataframe(result_df.head(50), use_container_width=True)
-                st.download_button(
-                    label="Download output Excel",
-                    data=dataframe_to_excel_bytes(result_df),
-                    file_name=output_filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-        with cache_tab:
-            render_master_database_section(master_database_path)
+        st.download_button(
+            label="Download output Excel",
+            data=dataframe_to_excel_bytes(result_df),
+            file_name=output_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 if __name__ == "__main__":
