@@ -714,12 +714,13 @@ def process_dataframe(
             text=f"Processed {idx}/{total} rows",
         )
         if idx % 25 == 0 or idx == total:
+            remaining = ((elapsed / idx) * (total - idx)) if idx and total > idx else 0.0
             status_text.markdown(
                 "\n".join(
                     [
-                        f"Started: `{format_timestamp(start_ts)}`",
-                        f"Last update: `{format_timestamp(time.time())}`",
                         f"Processed: `{idx}/{total}` rows",
+                        f"Elapsed time: `{elapsed:.1f}s`",
+                        f"Estimated remaining: `{remaining:.1f}s`",
                         f"Master DB hits: `{master_hits}`",
                         f"New LLM extractions: `{llm_runs}`",
                     ]
