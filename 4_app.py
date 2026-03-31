@@ -665,7 +665,7 @@ def process_dataframe(
         progress_metrics[1].metric("Master hits", 0)
         progress_metrics[2].metric("New LLM runs", 0)
         progress_metrics[3].metric("Elapsed", "0.0s")
-        progress_bar = st.progress(0, text="Preparing extraction run...")
+        progress_bar = st.progress(0, text="Preparing file processing...")
         status_text = st.empty()
 
     for idx, value in enumerate(result_df[address_column].tolist(), start=1):
@@ -709,20 +709,17 @@ def process_dataframe(
         progress_metrics[1].metric("Master hits", master_hits)
         progress_metrics[2].metric("New LLM runs", llm_runs)
         progress_metrics[3].metric("Elapsed", f"{elapsed:.1f}s")
+        remaining = ((elapsed / idx) * (total - idx)) if idx and total > idx else 0.0
         progress_bar.progress(
             idx / total if total else 1.0,
-            text=f"Processed {idx}/{total} rows",
+            text="Processing file...",
         )
         if idx % 25 == 0 or idx == total:
-            remaining = ((elapsed / idx) * (total - idx)) if idx and total > idx else 0.0
             status_text.markdown(
                 "\n".join(
                     [
-                        f"Processed: `{idx}/{total}` rows",
                         f"Elapsed time: `{elapsed:.1f}s`",
                         f"Estimated remaining: `{remaining:.1f}s`",
-                        f"Master DB hits: `{master_hits}`",
-                        f"New LLM extractions: `{llm_runs}`",
                     ]
                 )
             )
