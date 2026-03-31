@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import pandas as pd
 import streamlit as st
@@ -165,9 +165,24 @@ STRICT RULES:
    - Expand obvious city short forms (e.g., "NYC" -> "New York City") when unambiguous.
    - "2500 W.S.R. 60-Bartow, FL 33830" -> city "Bartow", state "Florida".
    - "PEACE RIVER (BARTOW, FL) (02/26/2025)" -> city "Bartow", state "Florida".
+   - When company names, plant names, suite numbers, dates, invoice text, or other noise appears alongside an address, ignore the noise and extract the embedded location if present.
+   - If a full address fragment clearly contains city/state/postal information, extract from that fragment even if other unrelated tokens appear before or after it.
    - If U.S. city and state/province is present but country isn't, set country to "United States".
    - If Canadian city and province is present but country isn't, set country to "Canada".
    - Prefer the most specific/complete location when multiple appear in context; otherwise null.
+
+EXAMPLES:
+Input: "EQ DETROIT INC 1923 FREDERICK ST, DETROIT, MI 48211"
+Output: {"city": "Detroit", "state_or_province": "Michigan", "country": "United States"}
+
+Input: "PEACE RIVER (BARTOW, FL) (02/26/2025)"
+Output: {"city": "Bartow", "state_or_province": "Florida", "country": "United States"}
+
+Input: "Toronto ON M5V 2T6"
+Output: {"city": "Toronto", "state_or_province": "Ontario", "country": "Canada"}
+
+Input: "Cycle chem, Inc"
+Output: {"city": null, "state_or_province": null, "country": null}
 
 OUTPUT FORMAT (JSON ONLY):
 {
@@ -186,8 +201,7 @@ TASK:
 Given a single company or brand name, return the city, state/province, and country of its primary corporate headquarters.
 
 RULES:
-- Only answer if you are highly confident.
-- If you are unsure, or if the name looks generic or is an industry (e.g., "paper mill", "pharma"), return nulls.
+- If you are unsure, or if the name looks generic or is an industry, check for the HQ address and extract City & State.
 - Prefer U.S./Canada formatting for state/province abbreviations or full names if applicable.
 
 OUTPUT FORMAT (JSON ONLY):
@@ -274,53 +288,26 @@ def normalize_city(city: Optional[str]) -> Optional[str]:
     return CITY_NORMALIZE.get(cleaned_city.lower(), cleaned_city)
 
 
-def smart_title(text: str) -> str:
-    parts = [part.strip() for part in text.split() if part.strip()]
-    return " ".join(part.capitalize() if part.isupper() else part for part in parts)
+def preprocess_text(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"[|;/]+", ", ", cleaned)
+    cleaned = re.sub(r"\((\d{1,2}/\d{1,2}/\d{2,4})\)", " ", cleaned)
+    cleaned = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", " ", cleaned)
+    cleaned = re.sub(r"\b(invoice|inv|po|purchase order|ref|reference)\b[:#\- ]*\w*", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" ,")
 
 
-def regex_extract_location(text: str) -> Tuple[Dict[str, Optional[str]], Optional[str]]:
-    cleaned_text = re.sub(r"\s+", " ", text or "").strip()
-    if not cleaned_text:
-        return {"city": None, "state_or_province": None, "country": None}, None
-
-    patterns = [
-        re.compile(
-            r"(?P<city>[A-Za-z][A-Za-z .'\-]+?)\s*,\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\b"
-        ),
-        re.compile(
-            r"(?P<city>[A-Za-z][A-Za-z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\b"
-        ),
-        re.compile(
-            r"(?P<city>[A-Za-z][A-Za-z .'\-]+?)\s*,\s*(?P<state>[A-Z]{2})\s*,\s*(?P<country>Canada|USA|US|United States)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"(?P<city>[A-Za-z][A-Za-z .'\-]+?)\s*,\s*(?P<state>[A-Z]{2})\b"
-        ),
-    ]
-
-    for pattern in patterns:
-        matches = list(pattern.finditer(cleaned_text))
-        if not matches:
-            continue
-
-        match = matches[-1]
-        city = smart_title(match.group("city").strip(" ,.-"))
-        state_token = match.group("state")
-        country = match.groupdict().get("country")
-
-        inferred_country = normalize_country(country) or infer_country_from_state(state_token)
-        normalized_state = expand_state_or_province(state_token, inferred_country)
-
-        if city and normalized_state:
-            return {
-                "city": normalize_city(city),
-                "state_or_province": normalized_state,
-                "country": inferred_country,
-            }, "regex"
-
-    return {"city": None, "state_or_province": None, "country": None}, None
+def has_location_signal(text: str) -> bool:
+    if not text:
+        return False
+    upper_text = text.upper()
+    has_us_state = any(f", {abbr}" in upper_text or f" {abbr} " in upper_text for abbr in US_STATES)
+    has_ca_province = any(f", {abbr}" in upper_text or f" {abbr} " in upper_text for abbr in CA_PROVINCES)
+    has_zip = re.search(r"\b\d{5}(?:-\d{4})?\b", text) is not None
+    has_ca_postal = re.search(r"\b[A-Z]\d[A-Z]\s?\d[A-Z]\d\b", upper_text) is not None
+    return has_us_state or has_ca_province or has_zip or has_ca_postal
 
 
 def looks_like_company_name(text: str) -> bool:
@@ -350,7 +337,7 @@ def call_llm(system_prompt: str, user_text: str) -> Dict[str, Optional[str]]:
     client = get_openai_client()
     response = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
-        temperature=0.2,
+        temperature=0.0,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
@@ -377,16 +364,22 @@ def extract_location(
             "error": None,
         }
 
-    regex_result, regex_method = regex_extract_location(text)
-    if regex_method:
-        regex_result["extraction_method"] = regex_method
-        regex_result["error"] = None
-        return regex_result
-
-    data = call_llm(SYSTEM_PROMPT, text)
+    cleaned_text = preprocess_text(text)
+    data = call_llm(SYSTEM_PROMPT, cleaned_text)
     city = data.get("city")
     state_or_province = data.get("state_or_province")
     country = data.get("country")
+    extraction_method = "llm"
+
+    if not any([city, state_or_province, country]) and cleaned_text != text:
+        retry_data = call_llm(
+            SYSTEM_PROMPT,
+            f"Focus on the most likely address fragment and ignore company/noise text.\nInput: {text}",
+        )
+        city = retry_data.get("city")
+        state_or_province = retry_data.get("state_or_province")
+        country = retry_data.get("country")
+        extraction_method = "llm_retry"
 
     if (
         allow_company_hq_fallback
@@ -397,6 +390,7 @@ def extract_location(
         city = fallback_data.get("city")
         state_or_province = fallback_data.get("state_or_province")
         country = fallback_data.get("country")
+        extraction_method = "hq_fallback"
 
     country = normalize_country(country)
     if not country:
@@ -407,15 +401,8 @@ def extract_location(
     normalized_state = expand_state_or_province(state_or_province, country)
     normalized_city = normalize_city(city)
 
-    extraction_method = "llm"
-    if (
-        allow_company_hq_fallback
-        and not any([data.get("city"), data.get("state_or_province"), data.get("country")])
-        and any([normalized_city, normalized_state, country])
-    ):
-        extraction_method = "hq_fallback"
     if not any([normalized_city, normalized_state, country]):
-        extraction_method = "unresolved"
+        extraction_method = "unresolved_with_signal" if has_location_signal(text) else "unresolved"
 
     return {
         "city": normalized_city,
