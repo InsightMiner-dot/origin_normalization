@@ -5,7 +5,7 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -13,10 +13,12 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI, BadRequestError
 
 DEFAULT_ADDRESS_COLUMN = "Address"
-DEFAULT_OUTPUT_FILE = "output_with_locations.xlsx"
 DEFAULT_SLEEP_BETWEEN_ROWS_SEC = 0.0
 DEFAULT_MASTER_DATABASE_FILE = "origin_normalization_master_database.csv"
-DEFAULT_LOG_FILE = "origin_normalization_app.log"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIT_DIR = os.path.join(APP_DIR, "audit")
+os.makedirs(AUDIT_DIR, exist_ok=True)
+DEFAULT_LOG_FILE = os.path.join(AUDIT_DIR, "origin_normalization_app.log")
 
 load_dotenv(override=True)
 
@@ -378,7 +380,23 @@ def looks_like_company_name(text: str) -> bool:
     return has_org_suffix or few_words_title_case or single_token_brand
 
 
-def call_llm(system_prompt: str, user_text: str) -> Dict[str, Optional[str]]:
+def empty_usage() -> Dict[str, int]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def merge_usage(*usage_items: Dict[str, int]) -> Dict[str, int]:
+    merged = empty_usage()
+    for usage in usage_items:
+        for key in merged:
+            merged[key] += int(usage.get(key, 0))
+    return merged
+
+
+def call_llm(system_prompt: str, user_text: str) -> Tuple[Dict[str, Optional[str]], Dict[str, int]]:
     client = get_openai_client()
     logger.info("Calling Azure OpenAI for location extraction.")
     response = client.chat.completions.create(
@@ -390,11 +408,16 @@ def call_llm(system_prompt: str, user_text: str) -> Dict[str, Optional[str]]:
             {"role": "user", "content": user_text},
         ],
     )
+    usage = {
+        "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
+    }
     raw = response.choices[0].message.content
     try:
-        return json.loads(raw)
+        return json.loads(raw), usage
     except Exception:
-        return {"city": None, "state_or_province": None, "country": None}
+        return {"city": None, "state_or_province": None, "country": None}, usage
 
 
 def extract_location(
@@ -408,15 +431,16 @@ def extract_location(
             "country": None,
             "extraction_method": "empty",
             "error": None,
+            "usage": empty_usage(),
         }
 
     cleaned_text = preprocess_text(text)
     try:
-        data = call_llm(SYSTEM_PROMPT, cleaned_text)
+        data, usage = call_llm(SYSTEM_PROMPT, cleaned_text)
     except BadRequestError:
         logger.warning("BadRequestError on primary extraction. Retrying with sanitized text.")
         cleaned_text = aggressive_sanitize_text(text)
-        data = call_llm(SYSTEM_PROMPT, cleaned_text)
+        data, usage = call_llm(SYSTEM_PROMPT, cleaned_text)
 
     city = data.get("city")
     state_or_province = data.get("state_or_province")
@@ -425,16 +449,17 @@ def extract_location(
 
     if not any([city, state_or_province, country]) and cleaned_text != text:
         try:
-            retry_data = call_llm(
+            retry_data, retry_usage = call_llm(
                 SYSTEM_PROMPT,
                 f"Focus on the most likely address fragment and ignore company/noise text.\nInput: {text}",
             )
         except BadRequestError:
             logger.warning("BadRequestError on retry extraction. Retrying with aggressively sanitized text.")
-            retry_data = call_llm(
+            retry_data, retry_usage = call_llm(
                 SYSTEM_PROMPT,
                 f"Focus on the most likely address fragment and ignore company/noise text.\nInput: {aggressive_sanitize_text(text)}",
             )
+        usage = merge_usage(usage, retry_usage)
         city = retry_data.get("city")
         state_or_province = retry_data.get("state_or_province")
         country = retry_data.get("country")
@@ -447,10 +472,11 @@ def extract_location(
     ):
         try:
             logger.info("Trying HQ fallback for organization-like text.")
-            fallback_data = call_llm(COMPANY_HQ_PROMPT, text)
+            fallback_data, fallback_usage = call_llm(COMPANY_HQ_PROMPT, text)
         except BadRequestError:
             logger.warning("BadRequestError on HQ fallback. Retrying with sanitized text.")
-            fallback_data = call_llm(COMPANY_HQ_PROMPT, aggressive_sanitize_text(text))
+            fallback_data, fallback_usage = call_llm(COMPANY_HQ_PROMPT, aggressive_sanitize_text(text))
+        usage = merge_usage(usage, fallback_usage)
         city = fallback_data.get("city")
         state_or_province = fallback_data.get("state_or_province")
         country = fallback_data.get("country")
@@ -474,6 +500,7 @@ def extract_location(
         "country": country,
         "extraction_method": extraction_method,
         "error": None,
+        "usage": usage,
     }
 
 
@@ -664,7 +691,7 @@ def process_dataframe(
     sleep_between_rows_sec: float,
     allow_company_hq_fallback: bool,
     master_database_path: str,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
     if address_column not in df.columns:
         raise ValueError(
             f"Column '{address_column}' not found. Available columns: {list(df.columns)}"
@@ -687,6 +714,7 @@ def process_dataframe(
     master_records_to_upsert = []
     master_hits = 0
     llm_runs = 0
+    token_usage = empty_usage()
 
     master_df = load_master_database(master_database_path)
 
@@ -707,6 +735,7 @@ def process_dataframe(
                     raw_text,
                     allow_company_hq_fallback=allow_company_hq_fallback,
                 )
+                token_usage = merge_usage(token_usage, result.get("usage", empty_usage()))
                 if should_store_in_master_database(result):
                     master_records_to_upsert.append(build_master_record(raw_text, result))
                     logger.info(
@@ -766,13 +795,16 @@ def process_dataframe(
     updated_master_df = upsert_master_database(master_df, master_records_to_upsert)
     save_master_database(updated_master_df, master_database_path)
     logger.info(
-        "Processing completed. Rows=%s, master_hits=%s, llm_runs=%s, stored_records=%s",
+        "Processing completed. Rows=%s, master_hits=%s, llm_runs=%s, stored_records=%s, prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
         total,
         master_hits,
         llm_runs,
         len(master_records_to_upsert),
+        token_usage["prompt_tokens"],
+        token_usage["completion_tokens"],
+        token_usage["total_tokens"],
     )
-    return result_df
+    return result_df, token_usage
 
 
 def get_excel_sheet_names(uploaded_file) -> list[str]:
@@ -799,6 +831,12 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def build_output_filename(uploaded_filename: str) -> str:
+    base_name, _ = os.path.splitext(os.path.basename(uploaded_filename))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_{timestamp}.xlsx"
+
+
 def main() -> None:
     st.set_page_config(page_title="Location Extraction Tool V2", layout="wide")
     st.title("Location Extraction Tool V2")
@@ -818,11 +856,11 @@ def main() -> None:
             value=True,
             help="If no location is found and the text looks like only a company name, try resolving the company's headquarters.",
         )
-        output_filename = st.text_input("Output file name", value=DEFAULT_OUTPUT_FILE)
         master_database_path = st.text_input(
             "Master database CSV",
             value=DEFAULT_MASTER_DATABASE_FILE,
         )
+        st.caption(f"Audit log folder: `{AUDIT_DIR}`")
 
     uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
 
@@ -853,6 +891,8 @@ def main() -> None:
         st.error(f"Unable to read the uploaded file: {exc}")
         return
 
+    output_filename = build_output_filename(uploaded_file.name)
+
     st.success("File loaded successfully.")
     st.write(f"Rows: {len(source_df)}")
     st.write(f"Columns: {', '.join(source_df.columns.astype(str))}")
@@ -869,7 +909,7 @@ def main() -> None:
         try:
             logger.info("Run extraction button clicked for file: %s", uploaded_file.name)
             with st.spinner("Extracting locations..."):
-                result_df = process_dataframe(
+                result_df, token_usage = process_dataframe(
                     source_df,
                     address_column=address_column,
                     sleep_between_rows_sec=sleep_between_rows_sec,
@@ -883,6 +923,11 @@ def main() -> None:
 
         st.success("Extraction completed.")
         st.caption(f"Master database updated at: {master_database_path}")
+        st.caption(
+            f"LLM tokens used | Input: {token_usage['prompt_tokens']} | Output: {token_usage['completion_tokens']} | Total: {token_usage['total_tokens']}"
+        )
+        st.caption(f"Audit log file: {DEFAULT_LOG_FILE}")
+        st.caption(f"Download file name: {output_filename}")
 
         with st.expander("Preview output data", expanded=True):
             st.dataframe(result_df.head(50), use_container_width=True)
