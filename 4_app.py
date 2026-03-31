@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -15,8 +16,16 @@ DEFAULT_ADDRESS_COLUMN = "Address"
 DEFAULT_OUTPUT_FILE = "output_with_locations.xlsx"
 DEFAULT_SLEEP_BETWEEN_ROWS_SEC = 0.0
 DEFAULT_MASTER_DATABASE_FILE = "origin_normalization_master_database.csv"
+DEFAULT_LOG_FILE = "origin_normalization_app.log"
 
 load_dotenv(override=True)
+
+logging.basicConfig(
+    filename=DEFAULT_LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_API_KEY = os.getenv("AZURE_OPENAI_KEY")
@@ -371,6 +380,7 @@ def looks_like_company_name(text: str) -> bool:
 
 def call_llm(system_prompt: str, user_text: str) -> Dict[str, Optional[str]]:
     client = get_openai_client()
+    logger.info("Calling Azure OpenAI for location extraction.")
     response = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         temperature=0.0,
@@ -404,6 +414,7 @@ def extract_location(
     try:
         data = call_llm(SYSTEM_PROMPT, cleaned_text)
     except BadRequestError:
+        logger.warning("BadRequestError on primary extraction. Retrying with sanitized text.")
         cleaned_text = aggressive_sanitize_text(text)
         data = call_llm(SYSTEM_PROMPT, cleaned_text)
 
@@ -419,6 +430,7 @@ def extract_location(
                 f"Focus on the most likely address fragment and ignore company/noise text.\nInput: {text}",
             )
         except BadRequestError:
+            logger.warning("BadRequestError on retry extraction. Retrying with aggressively sanitized text.")
             retry_data = call_llm(
                 SYSTEM_PROMPT,
                 f"Focus on the most likely address fragment and ignore company/noise text.\nInput: {aggressive_sanitize_text(text)}",
@@ -434,8 +446,10 @@ def extract_location(
         and looks_like_company_name(text)
     ):
         try:
+            logger.info("Trying HQ fallback for organization-like text.")
             fallback_data = call_llm(COMPANY_HQ_PROMPT, text)
         except BadRequestError:
+            logger.warning("BadRequestError on HQ fallback. Retrying with sanitized text.")
             fallback_data = call_llm(COMPANY_HQ_PROMPT, aggressive_sanitize_text(text))
         city = fallback_data.get("city")
         state_or_province = fallback_data.get("state_or_province")
@@ -482,11 +496,13 @@ def empty_master_database() -> pd.DataFrame:
 
 def load_master_database(master_database_path: str) -> pd.DataFrame:
     if not os.path.exists(master_database_path):
+        logger.info("Master database file not found. Starting with empty database.")
         return empty_master_database()
 
     try:
         master_df = pd.read_csv(master_database_path)
     except Exception:
+        logger.exception("Failed to read master database. Starting with empty database.")
         return empty_master_database()
 
     expected_columns = empty_master_database().columns.tolist()
@@ -499,6 +515,7 @@ def load_master_database(master_database_path: str) -> pd.DataFrame:
 
 def save_master_database(master_df: pd.DataFrame, master_database_path: str) -> None:
     master_df.to_csv(master_database_path, index=False)
+    logger.info("Master database saved to %s with %s records.", master_database_path, len(master_df))
 
 
 def build_master_record(text: str, result: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
@@ -519,6 +536,18 @@ def build_master_record(text: str, result: Dict[str, Optional[str]]) -> Dict[str
         "created_at": timestamp,
         "updated_at": timestamp,
     }
+
+
+def should_store_in_master_database(result: Dict[str, Optional[str]]) -> bool:
+    city = result.get("city")
+    state_or_province = result.get("state_or_province")
+    country = result.get("country")
+    extraction_method = result.get("extraction_method")
+
+    if extraction_method in {"error", "empty", "unresolved", "unresolved_with_signal"}:
+        return False
+
+    return any([city, state_or_province, country])
 
 
 def upsert_master_database(
@@ -641,6 +670,13 @@ def process_dataframe(
             f"Column '{address_column}' not found. Available columns: {list(df.columns)}"
         )
 
+    logger.info(
+        "Processing started. Rows=%s, address_column=%s, master_database=%s",
+        len(df),
+        address_column,
+        master_database_path,
+    )
+
     result_df = df.copy()
     city_out = []
     state_out = []
@@ -665,12 +701,25 @@ def process_dataframe(
             result = get_master_match(master_df, raw_text)
             if result:
                 master_hits += 1
+                logger.info("Master database hit for row %s.", idx)
             else:
                 result = extract_location(
                     raw_text,
                     allow_company_hq_fallback=allow_company_hq_fallback,
                 )
-                master_records_to_upsert.append(build_master_record(raw_text, result))
+                if should_store_in_master_database(result):
+                    master_records_to_upsert.append(build_master_record(raw_text, result))
+                    logger.info(
+                        "Stored new extraction candidate from row %s with method %s.",
+                        idx,
+                        result.get("extraction_method"),
+                    )
+                else:
+                    logger.info(
+                        "Skipped master database storage for row %s with method %s.",
+                        idx,
+                        result.get("extraction_method"),
+                    )
                 llm_runs += 1
 
             city = result.get("city")
@@ -692,6 +741,7 @@ def process_dataframe(
             city_state_out.append(None)
             method_out.append("error")
             error_out.append(str(exc))
+            logger.exception("Row %s failed during processing.", idx)
 
         if sleep_between_rows_sec > 0:
             time.sleep(sleep_between_rows_sec)
@@ -715,6 +765,13 @@ def process_dataframe(
 
     updated_master_df = upsert_master_database(master_df, master_records_to_upsert)
     save_master_database(updated_master_df, master_database_path)
+    logger.info(
+        "Processing completed. Rows=%s, master_hits=%s, llm_runs=%s, stored_records=%s",
+        total,
+        master_hits,
+        llm_runs,
+        len(master_records_to_upsert),
+    )
     return result_df
 
 
@@ -773,6 +830,8 @@ def main() -> None:
         st.info("Upload a file to begin.")
         return
 
+    logger.info("User uploaded file: %s", uploaded_file.name)
+
     selected_sheet_name = None
     if uploaded_file.name.lower().endswith((".xlsx", ".xls")):
         try:
@@ -790,6 +849,7 @@ def main() -> None:
     try:
         source_df = load_input_file(uploaded_file, selected_sheet_name)
     except Exception as exc:
+        logger.exception("Failed to load uploaded file: %s", uploaded_file.name)
         st.error(f"Unable to read the uploaded file: {exc}")
         return
 
@@ -807,6 +867,7 @@ def main() -> None:
 
     if st.button("Run extraction", type="primary"):
         try:
+            logger.info("Run extraction button clicked for file: %s", uploaded_file.name)
             with st.spinner("Extracting locations..."):
                 result_df = process_dataframe(
                     source_df,
@@ -816,6 +877,7 @@ def main() -> None:
                     master_database_path=master_database_path,
                 )
         except Exception as exc:
+            logger.exception("Processing failed for file: %s", uploaded_file.name)
             st.error(f"Processing failed: {exc}")
             return
 
